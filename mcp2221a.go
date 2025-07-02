@@ -8,6 +8,7 @@
 package mcp2221a
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -64,9 +65,10 @@ func makeMsg() []byte { return make([]byte, MsgSz) }
 // logMsg pretty-prints a given byte slice using the default log object. Each
 // element is printed on its own line with the following format in columns of
 // uniform-width:
-//    IDX: DEC {0xHEX} [0bBIN]
+//
+//	IDX: DEC {0xHEX} [0bBIN]
 func LogMsg(buf []byte) {
-	if nil == buf || 0 == len(buf) {
+	if nil == buf || len(buf) == 0 {
 		return
 	}
 	// calculate the number of digits in the final slice index
@@ -94,7 +96,7 @@ const (
 // isVRefValid verifies the given VRef v is one of the recognized enumerated
 // reference voltage values.
 func isVRefValid(v VRef) bool {
-	return (0 == v) || ((0x1 == (v & 0x1)) && (v < 0x08))
+	return (v == 0) || (((v & 0x1) == 0x1) && (v < 0x08))
 }
 
 // chanADC maps GPIO pin (0-3) to its respective ADC channel (0-2). if the pin
@@ -149,7 +151,7 @@ const (
 // interacting with that component of the device.
 // Call Close() on the device when finished to also close the USB connection.
 type MCP2221A struct {
-	Device *usb.Device
+	Device usb.Device
 	Index  byte
 	VID    uint16
 	PID    uint16
@@ -182,15 +184,8 @@ type MCP2221A struct {
 //
 // Returns an empty slice if no devices were found. See the hid package
 // documentation for details on inspecting the returned objects.
-func AttachedDevices(vid uint16, pid uint16) []usb.DeviceInfo {
-
-	var info []usb.DeviceInfo
-
-	for _, i := range usb.Enumerate(vid, pid) {
-		info = append(info, i)
-	}
-
-	return info
+func AttachedDevices(vid uint16, pid uint16) ([]usb.DeviceInfo, error) {
+	return usb.Enumerate(vid, pid)
 }
 
 // openUSBDevice returns an opened USB HID device descriptor with the given vid
@@ -200,20 +195,22 @@ func AttachedDevices(vid uint16, pid uint16) []usb.DeviceInfo {
 // Returns nil and an error if the given index is out of range (including when
 // no devices matching vid/pid were found), or if the USB HID device could not
 // be claimed or opened.
-func openUSBDevice(idx byte, vid uint16, pid uint16) (*usb.Device, error) {
+func openUSBDevice(idx byte, vid uint16, pid uint16) (usb.Device, error) {
 
-	info := AttachedDevices(vid, pid)
+	info, err := AttachedDevices(vid, pid)
+	if err != nil {
+		return nil, err
+	}
 	if int(idx) >= len(info) {
 		return nil, fmt.Errorf("device index %d out of range [0, %d]", idx, len(info)-1)
 	}
 
-	var (
-		dev *usb.Device
-		err error
-	)
-
-	if dev, err = info[idx].Open(); nil != err {
-		return nil, fmt.Errorf("Open(): %v", err)
+	dev, err := info[idx].Open()
+	if nil != err {
+		return nil, fmt.Errorf("Open(): %w", err)
+	}
+	if dev == nil {
+		return nil, fmt.Errorf("Open(): no device available")
 	}
 
 	return dev, nil
@@ -226,13 +223,9 @@ func openUSBDevice(idx byte, vid uint16, pid uint16) (*usb.Device, error) {
 // if the USB HID device could not be claimed or opened.
 func New(idx byte, vid uint16, pid uint16) (*MCP2221A, error) {
 
-	var (
-		dev *usb.Device
-		err error
-	)
-
-	if dev, err = openUSBDevice(idx, vid, pid); nil != err {
-		return nil, fmt.Errorf("openUSBDevice(): %v", err)
+	dev, err := openUSBDevice(idx, vid, pid)
+	if nil != err {
+		return nil, fmt.Errorf("openUSBDevice(): %w", err)
 	}
 
 	mcp := &MCP2221A{
@@ -272,7 +265,7 @@ func New(idx byte, vid uint16, pid uint16) (*MCP2221A, error) {
 	// initialize the device locked flag and flash write-access flag based on the
 	// chip security settings stored in flash memory.
 	if sec, err := mcp.flash.chipSecurity(); nil != err {
-		return nil, fmt.Errorf("flash.chipSecurity(): %v", err)
+		return nil, fmt.Errorf("flash.chipSecurity(): %w", err)
 	} else {
 		mcp.locked, mcp.flash.writeable = unlockFlags(sec)
 	}
@@ -380,30 +373,27 @@ func (mcp *MCP2221A) Reset(timeout time.Duration) error {
 	cmd[3] = 0xEF
 
 	if _, err := mcp.send(cmdReset, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
+	// We need to reconnect after a reset
+	mcp.Device = nil
 
-	ch := make(chan *usb.Device)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	go func(c chan *usb.Device) {
-		var d *usb.Device = nil
-		for nil == d {
-			d, _ = openUSBDevice(mcp.Index, mcp.VID, mcp.PID)
+	for mcp.Device == nil {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("New([%d]): timed out (re)opening USB HID device", mcp.Index)
+		default:
+			mcp.Device, _ = openUSBDevice(mcp.Index, mcp.VID, mcp.PID)
 		}
-		c <- d
-	}(ch)
-
-	select {
-	case <-time.After(timeout):
-		return fmt.Errorf("New([%d]): timed out opening USB HID device", mcp.Index)
-	case dev := <-ch:
-		mcp.Device = dev
 	}
 
 	// initialize the device locked flag and flash write-access flag based on the
 	// chip security settings stored in flash memory.
 	if sec, err := mcp.flash.chipSecurity(); nil != err {
-		return fmt.Errorf("flash.chipSecurity(): %v", err)
+		return fmt.Errorf("flash.chipSecurity(): %w", err)
 	} else {
 		mcp.locked, mcp.flash.writeable = unlockFlags(sec)
 	}
@@ -447,7 +437,7 @@ func parseStatus(msg []byte) *status {
 	}
 	return &status{
 		cmd:       msg[0],
-		ok:        (0 == msg[1]),
+		ok:        (msg[1] == 0),
 		i2cCancel: msg[2],
 		i2cSpdChg: msg[3],
 		i2cClkChg: msg[4],
@@ -493,7 +483,7 @@ func (mcp *MCP2221A) status() (*status, error) {
 
 	cmd := makeMsg()
 	if rsp, err := mcp.send(cmdStatus, cmd); nil != err {
-		return nil, fmt.Errorf("send(): %v", err)
+		return nil, fmt.Errorf("send(): %w", err)
 	} else {
 		return parseStatus(rsp), nil
 	}
@@ -511,7 +501,7 @@ func (mcp *MCP2221A) USBManufacturer() (string, error) {
 	}
 
 	if rsp, err := mcp.flash.read(subcmdUSBMfgDesc); nil != err {
-		return "", fmt.Errorf("read(): %v", err)
+		return "", fmt.Errorf("read(): %w", err)
 	} else {
 		return parseFlashString(rsp), nil
 	}
@@ -529,7 +519,7 @@ func (mcp *MCP2221A) USBProduct() (string, error) {
 	}
 
 	if rsp, err := mcp.flash.read(subcmdUSBProdDesc); nil != err {
-		return "", fmt.Errorf("read(): %v", err)
+		return "", fmt.Errorf("read(): %w", err)
 	} else {
 		return parseFlashString(rsp), nil
 	}
@@ -547,7 +537,7 @@ func (mcp *MCP2221A) USBSerialNo() (string, error) {
 	}
 
 	if rsp, err := mcp.flash.read(subcmdUSBSerialNo); nil != err {
-		return "", fmt.Errorf("read(): %v", err)
+		return "", fmt.Errorf("read(): %w", err)
 	} else {
 		return parseFlashString(rsp), nil
 	}
@@ -565,7 +555,7 @@ func (mcp *MCP2221A) FactorySerialNo() (string, error) {
 	}
 
 	if rsp, err := mcp.flash.read(subcmdSerialNo); nil != err {
-		return "", fmt.Errorf("read(): %v", err)
+		return "", fmt.Errorf("read(): %w", err)
 	} else {
 		cnt := rsp[2] - 2
 		if cnt > MsgSz-4 {
@@ -599,7 +589,7 @@ func (mcp *MCP2221A) ConfigVIDPID(vid uint16, pid uint16) error {
 	}
 
 	if cmd, err := mcp.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("chipSettings(): %v", err)
+		return fmt.Errorf("chipSettings(): %w", err)
 	} else {
 
 		cmd[6] = byte(vid & 0xFF)
@@ -608,7 +598,7 @@ func (mcp *MCP2221A) ConfigVIDPID(vid uint16, pid uint16) error {
 		cmd[9] = byte((pid >> 8) & 0xFF)
 
 		if err := mcp.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("write(): %v", err)
+			return fmt.Errorf("write(): %w", err)
 		}
 	}
 
@@ -638,13 +628,13 @@ func (mcp *MCP2221A) ConfigReqCurrent(ma uint16) error {
 	}
 
 	if cmd, err := mcp.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("chipSettings(): %v", err)
+		return fmt.Errorf("chipSettings(): %w", err)
 	} else {
 
 		cmd[11] = byte(req / 2)
 
 		if err := mcp.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("write(): %v", err)
+			return fmt.Errorf("write(): %w", err)
 		}
 	}
 
@@ -680,11 +670,12 @@ func unlockFlags(sec ChipSecurity) (bool, bool) {
 // then this command has no effect and its return value is not guaranteed.
 //
 // IMPORTANT-SECURITY-1:
-//   Sending too many flash access commands with the incorrect password will
-//   **PERMANENTLY** lock the flash memory device from write access. Read access
-//   is still permitted, but there is absolutely no way to write any changes to
-//   flash memory. Congratulations, you have sorta-ruined your MCP2221A. Trust
-//   me, I can empathize, very unfortunately.
+//
+//	Sending too many flash access commands with the incorrect password will
+//	**PERMANENTLY** lock the flash memory device from write access. Read access
+//	is still permitted, but there is absolutely no way to write any changes to
+//	flash memory. Congratulations, you have sorta-ruined your MCP2221A. Trust
+//	me, I can empathize, very unfortunately.
 //
 // Returns false and an error if the receiver is invalid, the password slice is
 // nil, the password command could not be sent, the provided password was
@@ -719,7 +710,7 @@ func (mcp *MCP2221A) ConfigUnlock(pass []byte) (bool, error) {
 		// err is set when our response status code (byte index 1) is non-zero, but
 		// we need to inspect that code to identify rejection reason (below).
 		if nil == rsp {
-			return false, fmt.Errorf("send(): %v", err)
+			return false, fmt.Errorf("send(): %w", err)
 		}
 	}
 
@@ -765,7 +756,7 @@ func (mod *sram) read() ([]byte, error) {
 
 	cmd := makeMsg()
 	if rsp, err := mod.send(cmdSRAMGet, cmd); nil != err {
-		return nil, fmt.Errorf("send(): %v", err)
+		return nil, fmt.Errorf("send(): %w", err)
 	} else {
 		return rsp, nil
 	}
@@ -787,7 +778,7 @@ func (mod *sram) readRange(start byte, stop byte) ([]byte, error) {
 	}
 
 	if rsp, err := mod.read(); nil != err {
-		return nil, fmt.Errorf("read(): %v", err)
+		return nil, fmt.Errorf("read(): %w", err)
 	} else {
 		return rsp[start : stop+1], nil
 	}
@@ -875,12 +866,12 @@ func parseChipSettings(msg []byte) *chipSettings {
 		return nil
 	}
 	return &chipSettings{
-		cdcSerialNoEnumEnable: 0x01 == ((msg[4] >> 7) & 0x01),
-		ledURXPol:             Polarity(0x01 == ((msg[4] >> 6) & 0x01)),
-		ledUTXPol:             Polarity(0x01 == ((msg[4] >> 5) & 0x01)),
-		ledI2CPol:             Polarity(0x01 == ((msg[4] >> 4) & 0x01)),
-		suspndPol:             Polarity(0x01 == ((msg[4] >> 3) & 0x01)),
-		usbcfgPol:             Polarity(0x01 == ((msg[4] >> 2) & 0x01)),
+		cdcSerialNoEnumEnable: ((msg[4] >> 7) & 0x01) == 0x01,
+		ledURXPol:             Polarity(((msg[4] >> 6) & 0x01) == 0x01),
+		ledUTXPol:             Polarity(((msg[4] >> 5) & 0x01) == 0x01),
+		ledI2CPol:             Polarity(((msg[4] >> 4) & 0x01) == 0x01),
+		suspndPol:             Polarity(((msg[4] >> 3) & 0x01) == 0x01),
+		usbcfgPol:             Polarity(((msg[4] >> 2) & 0x01) == 0x01),
 		chipSecurity:          ChipSecurity(msg[4] & 0x03),
 		clkOutDiv:             msg[5] & 0x0F,
 		dacVRef:               VRef((msg[6] >> 5) & 0x03),
@@ -937,7 +928,7 @@ func (mod *flash) read(sub byte) ([]byte, error) {
 	cmd[1] = sub
 
 	if rsp, err := mod.send(cmdFlashRead, cmd); nil != err {
-		return nil, fmt.Errorf("send(): %v", err)
+		return nil, fmt.Errorf("send(): %w", err)
 	} else {
 		return rsp, nil
 	}
@@ -968,7 +959,7 @@ func (mod *flash) write(sub byte, data []byte) error {
 	data[1] = sub
 
 	if _, err := mod.send(cmdFlashWrite, data); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -986,15 +977,15 @@ func (mod *flash) write(sub byte, data []byte) error {
 // flash-read response are exactly the same, except that the flash-write content
 // starts at byte index 2:
 //
-//          READ-CHIP-SETTINGS       WRITE-CHIP-SETTINGS
-//         --------------------     ---------------------
-//  [0]          Command                  Command
-//  [1]          Success                 Subcommand
-//  [2]          Length              <CHIP-SETTINGS[0]>
-//  [3]          Ignored             <CHIP-SETTINGS[1]>
-//  [4]     <CHIP-SETTINGS[0]>       <CHIP-SETTINGS[2]>
-//  [5]     <CHIP-SETTINGS[1]>       <CHIP-SETTINGS[3]>
-//  [N]            ...                      ...
+//	        READ-CHIP-SETTINGS       WRITE-CHIP-SETTINGS
+//	       --------------------     ---------------------
+//	[0]          Command                  Command
+//	[1]          Success                 Subcommand
+//	[2]          Length              <CHIP-SETTINGS[0]>
+//	[3]          Ignored             <CHIP-SETTINGS[1]>
+//	[4]     <CHIP-SETTINGS[0]>       <CHIP-SETTINGS[2]>
+//	[5]     <CHIP-SETTINGS[1]>       <CHIP-SETTINGS[3]>
+//	[N]            ...                      ...
 //
 // If write is false, the message formatted underneath READ-CHIP-SETTINGS is
 // returned.
@@ -1010,7 +1001,7 @@ func (mod *flash) chipSettings(write bool) ([]byte, error) {
 	}
 
 	if rsp, err := mod.read(subcmdChipSettings); nil != err {
-		return nil, fmt.Errorf("read(): %v", err)
+		return nil, fmt.Errorf("read(): %w", err)
 	} else {
 		if write {
 			cmd := makeMsg()
@@ -1035,7 +1026,7 @@ func (mod *flash) chipSecurity() (ChipSecurity, error) {
 
 	// read the current chip settings stored in flash memory
 	if chp, err := mod.chipSettings(false); nil != err {
-		return SecLocked2, fmt.Errorf("chipSettings(): %v", err)
+		return SecLocked2, fmt.Errorf("chipSettings(): %w", err)
 	} else {
 		cs := parseChipSettings(chp)
 		return cs.chipSecurity, nil
@@ -1058,7 +1049,7 @@ func (mod *flash) gpioSettings() ([]byte, error) {
 	}
 
 	if rsp, err := mod.read(subcmdGPSettings); nil != err {
-		return nil, fmt.Errorf("read(): %v", err)
+		return nil, fmt.Errorf("read(): %w", err)
 	} else {
 		return rsp[4:8], nil
 	}
@@ -1137,7 +1128,7 @@ func (mod *GPIO) SetConfig(pin byte, val byte, mode GPIOMode, dir GPIODir) error
 	cmd := makeMsg()
 
 	if cur, err := mod.sram.readRange(22, 25); nil != err {
-		return fmt.Errorf("sram.readRange(): %v", err)
+		return fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		// copy the current GPIO settings because they will -all- be set with the
 		// command request
@@ -1149,7 +1140,7 @@ func (mod *GPIO) SetConfig(pin byte, val byte, mode GPIOMode, dir GPIODir) error
 	cmd[8+pin] = (val << 4) | (byte(dir) << 3) | byte(mode)
 
 	if _, err := mod.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1173,13 +1164,13 @@ func (mod *GPIO) FlashConfig(pin byte, val byte, mode GPIOMode, dir GPIODir) err
 	}
 
 	if err := mod.SetConfig(pin, val, mode, dir); nil != err {
-		return fmt.Errorf("SetConfig(): %v", err)
+		return fmt.Errorf("SetConfig(): %w", err)
 	}
 
 	cmd := makeMsg()
 
 	if cur, err := mod.flash.gpioSettings(); nil != err {
-		return fmt.Errorf("flash.gpioSettings(): %v", err)
+		return fmt.Errorf("flash.gpioSettings(): %w", err)
 	} else {
 		copy(cmd[2:], cur)
 	}
@@ -1187,7 +1178,7 @@ func (mod *GPIO) FlashConfig(pin byte, val byte, mode GPIOMode, dir GPIODir) err
 	cmd[2+pin] = (val << 4) | (byte(dir) << 3) | byte(mode)
 
 	if err := mod.flash.write(subcmdGPSettings, cmd); nil != err {
-		return fmt.Errorf("flash.write(): %v", err)
+		return fmt.Errorf("flash.write(): %w", err)
 	}
 
 	return nil
@@ -1209,7 +1200,7 @@ func (mod *GPIO) GetConfig(pin byte) (byte, GPIOMode, GPIODir, error) {
 	}
 
 	if rsp, err := mod.sram.readRange(22, 25); nil != err {
-		return WordClr, ModeInvalid, DirInvalid, fmt.Errorf("sram.readRange(): %v", err)
+		return WordClr, ModeInvalid, DirInvalid, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		mode := GPIOMode(rsp[pin] & 0x07)
 		dir := GPIODir((rsp[pin] >> 3) & 0x01)
@@ -1241,7 +1232,7 @@ func (mod *GPIO) Set(pin byte, val byte) error {
 	cmd[i+3] = byte(DirOutput)
 
 	if _, err := mod.send(cmdGPIOSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1263,7 +1254,7 @@ func (mod *GPIO) Get(pin byte) (byte, error) {
 
 	cmd := makeMsg()
 	if rsp, err := mod.send(cmdGPIOGet, cmd); nil != err {
-		return WordClr, fmt.Errorf("send(): %v", err)
+		return WordClr, fmt.Errorf("send(): %w", err)
 	} else {
 		i := 2 + 2*pin
 		if byte(ModeInvalid) == rsp[i] {
@@ -1311,7 +1302,7 @@ func (mod *ADC) SetConfig(pin byte, ref VRef) error {
 	}
 
 	if err := mod.GPIO.SetConfig(pin, WordClr, ModeADC, DirInput); nil != err {
-		return fmt.Errorf("GPIO.SetConfig(): %v", err)
+		return fmt.Errorf("GPIO.SetConfig(): %w", err)
 	}
 
 	cmd := makeMsg()
@@ -1320,7 +1311,7 @@ func (mod *ADC) SetConfig(pin byte, ref VRef) error {
 	cmd[5] = (1 << 7) | byte(ref)
 
 	if _, err := mod.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1352,17 +1343,17 @@ func (mod *ADC) FlashConfig(pin byte, ref VRef) error {
 	}
 
 	if err := mod.GPIO.FlashConfig(pin, WordClr, ModeADC, DirInput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := mod.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 		cmd[5] &= ^byte(0x07 << 2) // mask off the VRef bits (2-4)
 		cmd[5] |= (byte(ref) << 2)
 
 		if err := mod.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -1389,7 +1380,7 @@ func (mod *ADC) GetConfig(pin byte) (VRef, error) {
 	}
 
 	if buf, err := mod.sram.readRange(7, 7); nil != err {
-		return VRefDefault, fmt.Errorf("sram.readRange(): %v", err)
+		return VRefDefault, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		ref := VRef((buf[0] >> 2) & 0x07)
 		return ref, nil
@@ -1422,7 +1413,7 @@ func (mod *ADC) Read(pin byte) (uint16, error) {
 	}
 
 	if stat, err := mod.status(); nil != err {
-		return 0, fmt.Errorf("status(): %v", err)
+		return 0, fmt.Errorf("status(): %w", err)
 	} else {
 		return stat.adcChan[adc], nil
 	}
@@ -1465,7 +1456,7 @@ func (mod *DAC) SetConfig(pin byte, ref VRef) error {
 	}
 
 	if err := mod.GPIO.SetConfig(pin, WordClr, ModeDAC, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.SetConfig(): %v", err)
+		return fmt.Errorf("GPIO.SetConfig(): %w", err)
 	}
 
 	cmd := makeMsg()
@@ -1474,7 +1465,7 @@ func (mod *DAC) SetConfig(pin byte, ref VRef) error {
 	cmd[3] = (1 << 7) | byte(ref)
 
 	if _, err := mod.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1506,16 +1497,16 @@ func (mod *DAC) FlashConfig(pin byte, ref VRef, val byte) error {
 	}
 
 	if err := mod.GPIO.FlashConfig(pin, WordClr, ModeDAC, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := mod.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 		cmd[4] = (byte(ref) << 5) | (val & 0x1F)
 
 		if err := mod.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -1543,7 +1534,7 @@ func (mod *DAC) GetConfig(pin byte) (byte, VRef, error) {
 	}
 
 	if buf, err := mod.sram.readRange(6, 6); nil != err {
-		return WordClr, VRefDefault, fmt.Errorf("sram.readRange(): %v", err)
+		return WordClr, VRefDefault, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		val := buf[0] & 0x1F // power-up DAC value (bits 0-4)
 		ref := VRef((buf[0] >> 5) & 0x07)
@@ -1574,7 +1565,7 @@ func (mod *DAC) Write(val byte) error {
 	cmd[4] = (1 << 7) | byte(out)
 
 	if _, err := mod.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1636,11 +1627,11 @@ func (alt *SUSPND) FlashConfig(pol Polarity) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinSUSPND, WordClr, ModeSUSPND, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 
 		cmd[2] &= ^byte(0x01 << 3) // mask off the SSPND bit (3)
@@ -1653,7 +1644,7 @@ func (alt *SUSPND) FlashConfig(pol Polarity) error {
 		}
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -1677,9 +1668,9 @@ func (alt *SUSPND) GetConfig() (Polarity, error) {
 	}
 
 	if buf, err := alt.sram.readRange(4, 4); nil != err {
-		return false, fmt.Errorf("sram.readRange(): %v", err)
+		return false, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
-		pol := Polarity(0x00 == ((buf[0] >> 3) & 0x01))
+		pol := Polarity(((buf[0] >> 3) & 0x01) == 0x00)
 		return pol, nil
 	}
 }
@@ -1753,7 +1744,7 @@ func (alt *CLKOUT) SetConfig(clk ClkOut, dut DutyCycle) error {
 	}
 
 	if err := alt.GPIO.SetConfig(pinCLKOUT, WordClr, ModeCLKOUT, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.SetConfig(): %v", err)
+		return fmt.Errorf("GPIO.SetConfig(): %w", err)
 	}
 
 	// first, configure the interrupt detection module per edge argument
@@ -1763,7 +1754,7 @@ func (alt *CLKOUT) SetConfig(clk ClkOut, dut DutyCycle) error {
 	cmd[2] = (1 << 7) | (byte(dut) << 3) | byte(clk)
 
 	if _, err := alt.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -1792,16 +1783,16 @@ func (alt *CLKOUT) FlashConfig(clk ClkOut, dut DutyCycle) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinCLKOUT, WordClr, ModeCLKOUT, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 		cmd[3] = (byte(dut) << 3) | byte(clk)
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -1822,7 +1813,7 @@ func (alt *CLKOUT) GetConfig() (ClkOut, DutyCycle, error) {
 	}
 
 	if buf, err := alt.sram.readRange(5, 5); nil != err {
-		return ClkRes, Duty0Pct, fmt.Errorf("sram.readRange(): %v", err)
+		return ClkRes, Duty0Pct, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		clk := ClkOut(buf[0] & 0x07)
 		dut := DutyCycle((buf[0] >> 3) & 0x03)
@@ -1855,11 +1846,11 @@ func (alt *USBCFG) FlashConfig(pol Polarity) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinUSBCFG, WordClr, ModeUSBCFG, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 
 		cmd[2] &= ^byte(0x01 << 2) // mask off the USBCFG bit (2)
@@ -1872,7 +1863,7 @@ func (alt *USBCFG) FlashConfig(pol Polarity) error {
 		}
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -1897,9 +1888,9 @@ func (alt *USBCFG) GetConfig() (Polarity, error) {
 	}
 
 	if buf, err := alt.sram.readRange(4, 4); nil != err {
-		return false, fmt.Errorf("sram.readRange(): %v", err)
+		return false, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
-		pol := Polarity(0x01 == ((buf[0] >> 2) & 0x01))
+		pol := Polarity(((buf[0] >> 2) & 0x01) == 0x01)
 		return pol, nil
 	}
 }
@@ -1942,7 +1933,7 @@ func (alt *INTCHG) SetConfig(edge IntEdge) error {
 	}
 
 	if err := alt.GPIO.SetConfig(pinINTCHG, WordClr, ModeINTCHG, DirInput); nil != err {
-		return fmt.Errorf("GPIO.SetConfig(): %v", err)
+		return fmt.Errorf("GPIO.SetConfig(): %w", err)
 	}
 
 	// first, configure the interrupt detection module per edge argument
@@ -1967,7 +1958,7 @@ func (alt *INTCHG) SetConfig(edge IntEdge) error {
 	}
 
 	if _, err := alt.send(cmdSRAMSet, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	// next, clear the interrupt detection flag in SRAM
@@ -1976,7 +1967,7 @@ func (alt *INTCHG) SetConfig(edge IntEdge) error {
 	cmd[24] = WordClr
 
 	if _, err := alt.send(cmdSetParams, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	}
 
 	return nil
@@ -2003,17 +1994,17 @@ func (alt *INTCHG) FlashConfig(edge IntEdge) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinINTCHG, WordClr, ModeINTCHG, DirInput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 		cmd[5] &= ^byte(0x03 << 5) // mask off the edge bits (5-6)
 		cmd[5] |= (byte(edge) << 5)
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -2032,7 +2023,7 @@ func (alt *INTCHG) GetConfig() (IntEdge, error) {
 	}
 
 	if buf, err := alt.sram.readRange(7, 7); nil != err {
-		return NoInterrupt, fmt.Errorf("sram.readRange(): %v", err)
+		return NoInterrupt, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
 		edge := IntEdge((buf[0] >> 5) & 0x03)
 		return edge, nil
@@ -2065,11 +2056,11 @@ func (alt *LEDI2C) FlashConfig(pol Polarity) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinLEDI2C, WordClr, ModeLEDI2C, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 
 		cmd[2] &= ^byte(0x01 << 4) // mask off the LED_I2C bit (4)
@@ -2082,7 +2073,7 @@ func (alt *LEDI2C) FlashConfig(pol Polarity) error {
 		}
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -2107,9 +2098,9 @@ func (alt *LEDI2C) GetConfig() (Polarity, error) {
 	}
 
 	if buf, err := alt.sram.readRange(4, 4); nil != err {
-		return false, fmt.Errorf("sram.readRange(): %v", err)
+		return false, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
-		pol := Polarity(0x00 == ((buf[0] >> 4) & 0x01))
+		pol := Polarity(((buf[0] >> 4) & 0x01) == 0x00)
 		return pol, nil
 	}
 }
@@ -2140,11 +2131,11 @@ func (alt *LEDURX) FlashConfig(pol Polarity) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinLEDURX, WordClr, ModeLEDURX, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 
 		cmd[2] &= ^byte(0x01 << 6) // mask off the LED_URX bit (6)
@@ -2157,7 +2148,7 @@ func (alt *LEDURX) FlashConfig(pol Polarity) error {
 		}
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -2182,9 +2173,9 @@ func (alt *LEDURX) GetConfig() (Polarity, error) {
 	}
 
 	if buf, err := alt.sram.readRange(4, 4); nil != err {
-		return false, fmt.Errorf("sram.readRange(): %v", err)
+		return false, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
-		pol := Polarity(0x00 == ((buf[0] >> 6) & 0x01))
+		pol := Polarity(((buf[0] >> 6) & 0x01) == 0x00)
 		return pol, nil
 	}
 }
@@ -2215,11 +2206,11 @@ func (alt *LEDUTX) FlashConfig(pol Polarity) error {
 	}
 
 	if err := alt.GPIO.FlashConfig(pinLEDUTX, WordClr, ModeLEDUTX, DirOutput); nil != err {
-		return fmt.Errorf("GPIO.FlashConfig(): %v", err)
+		return fmt.Errorf("GPIO.FlashConfig(): %w", err)
 	}
 
 	if cmd, err := alt.flash.chipSettings(true); nil != err {
-		return fmt.Errorf("flash.chipSettings(): %v", err)
+		return fmt.Errorf("flash.chipSettings(): %w", err)
 	} else {
 
 		cmd[2] &= ^byte(0x01 << 5) // mask off the LED_UTX bit (5)
@@ -2232,7 +2223,7 @@ func (alt *LEDUTX) FlashConfig(pol Polarity) error {
 		}
 
 		if err := alt.flash.write(subcmdChipSettings, cmd); nil != err {
-			return fmt.Errorf("flash.write(): %v", err)
+			return fmt.Errorf("flash.write(): %w", err)
 		}
 	}
 
@@ -2257,9 +2248,9 @@ func (alt *LEDUTX) GetConfig() (Polarity, error) {
 	}
 
 	if buf, err := alt.sram.readRange(4, 4); nil != err {
-		return false, fmt.Errorf("sram.readRange(): %v", err)
+		return false, fmt.Errorf("sram.readRange(): %w", err)
 	} else {
-		pol := Polarity(0x00 == ((buf[0] >> 5) & 0x01))
+		pol := Polarity(((buf[0] >> 5) & 0x01) == 0x00)
 		return pol, nil
 	}
 }
@@ -2299,7 +2290,7 @@ const (
 	i2cStateAddrTimeout byte = 0x23
 	i2cStateAddrNACK    byte = 0x25
 
-	i2cMaskAddrNACK byte = 0x40
+	i2cMaskAddrNACK byte = 0x40 //nolint:unused
 
 	i2cStatePartialData   byte = 0x41
 	i2cStateReadMore      byte = 0x43
@@ -2359,10 +2350,10 @@ func (mod *I2C) SetConfig(baud uint32) error {
 	cmd[4] = byte(ClkHz/baud - 3)
 
 	if rsp, err := mod.send(cmdSetParams, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	} else {
 		stat := parseStatus(rsp)
-		if 0x21 == stat.i2cSpdChg {
+		if stat.i2cSpdChg == 0x21 {
 			return fmt.Errorf("transfer in progress")
 		}
 	}
@@ -2385,10 +2376,10 @@ func (mod *I2C) Cancel() error {
 	cmd[2] = 0x10
 
 	if rsp, err := mod.send(cmdSetParams, cmd); nil != err {
-		return fmt.Errorf("send(): %v", err)
+		return fmt.Errorf("send(): %w", err)
 	} else {
 		stat := parseStatus(rsp)
-		if 0x10 == stat.i2cCancel {
+		if stat.i2cCancel == 0x10 {
 			time.Sleep(300 * time.Microsecond)
 		}
 	}
@@ -2427,12 +2418,12 @@ func (mod *I2C) Write(stop bool, addr uint8, out []byte, cnt uint16) error {
 	)
 
 	if stat, err = mod.status(); nil != err {
-		return fmt.Errorf("status(): %v", err)
+		return fmt.Errorf("status(): %w", err)
 	}
 
 	if WordClr != stat.i2cState {
 		if err := mod.I2C.Cancel(); nil != err {
-			return fmt.Errorf("I2C.Cancel(): %v", err)
+			return fmt.Errorf("I2C.Cancel(): %w", err)
 		}
 	}
 
@@ -2474,7 +2465,7 @@ func (mod *I2C) Write(stop bool, addr uint8, out []byte, cnt uint16) error {
 						return fmt.Errorf("send(): I²C write timed out")
 					}
 				} else {
-					return fmt.Errorf("send(): %v", err)
+					return fmt.Errorf("send(): %w", err)
 				}
 				time.Sleep(300 * time.Microsecond)
 			} else {
@@ -2500,7 +2491,7 @@ func (mod *I2C) Write(stop bool, addr uint8, out []byte, cnt uint16) error {
 	for retry < i2cWriteRetry {
 		retry++
 		if stat, err := mod.status(); nil != err {
-			return fmt.Errorf("status(): %v", err)
+			return fmt.Errorf("status(): %w", err)
 		} else {
 			if WordClr == stat.i2cState {
 				break
@@ -2548,12 +2539,12 @@ func (mod *I2C) Read(rep bool, addr uint8, cnt uint16) ([]byte, error) {
 	)
 
 	if stat, err = mod.status(); nil != err {
-		return nil, fmt.Errorf("status(): %v", err)
+		return nil, fmt.Errorf("status(): %w", err)
 	}
 
 	if WordClr != stat.i2cState && i2cStateWritingNoStop != stat.i2cState {
 		if err := mod.I2C.Cancel(); nil != err {
-			return nil, fmt.Errorf("I2C.Cancel(): %v", err)
+			return nil, fmt.Errorf("I2C.Cancel(): %w", err)
 		}
 	}
 
@@ -2568,7 +2559,7 @@ func (mod *I2C) Read(rep bool, addr uint8, cnt uint16) ([]byte, error) {
 	}
 
 	if _, err := mod.send(cmdID, cmd); nil != err {
-		return nil, fmt.Errorf("send(): %v", err)
+		return nil, fmt.Errorf("send(): %w", err)
 	}
 
 	in := make([]byte, cnt)
@@ -2586,7 +2577,7 @@ func (mod *I2C) Read(rep bool, addr uint8, cnt uint16) ([]byte, error) {
 			retry++
 			cmd := makeMsg()
 			if rsp, err = mod.send(cmdI2CReadGetData, cmd); nil != err {
-				return nil, fmt.Errorf("send(): %v", err)
+				return nil, fmt.Errorf("send(): %w", err)
 			} else {
 				if i2cStatePartialData == rsp[1] || i2cStateReadError == rsp[3] {
 					time.Sleep(300 * time.Microsecond)
@@ -2595,7 +2586,7 @@ func (mod *I2C) Read(rep bool, addr uint8, cnt uint16) ([]byte, error) {
 				if i2cStateNACK(rsp[2]) {
 					return nil, fmt.Errorf("send(): I²C NACK from address (0x%02X)", addr)
 				}
-				if WordClr == rsp[2] && 0 == rsp[3] {
+				if WordClr == rsp[2] && rsp[3] == 0 {
 					break
 				}
 				if i2cStateReadPartial == rsp[2] || i2cStateReadComplete == rsp[2] {
@@ -2632,11 +2623,11 @@ func (mod *I2C) Read(rep bool, addr uint8, cnt uint16) ([]byte, error) {
 func (mod *I2C) ReadReg(addr uint8, reg uint8, cnt uint16) ([]byte, error) {
 
 	if err := mod.I2C.Write(false, addr, []byte{reg}, 1); nil != err {
-		return nil, fmt.Errorf("I2C.Write(): %v", err)
+		return nil, fmt.Errorf("I2C.Write(): %w", err)
 	}
 
 	if reg, err := mod.I2C.Read(true, addr, cnt); nil != err {
-		return nil, fmt.Errorf("I2C.Read(): %v", err)
+		return nil, fmt.Errorf("I2C.Read(): %w", err)
 	} else {
 		return reg, nil
 	}
@@ -2661,11 +2652,11 @@ func (mod *I2C) ReadReg16(addr uint8, reg uint16, msb bool, cnt uint16) ([]byte,
 	}
 
 	if err := mod.I2C.Write(false, addr, buf, 2); nil != err {
-		return nil, fmt.Errorf("I2C.Write(): %v", err)
+		return nil, fmt.Errorf("I2C.Write(): %w", err)
 	}
 
 	if reg, err := mod.I2C.Read(true, addr, cnt); nil != err {
-		return nil, fmt.Errorf("I2C.Read(): %v", err)
+		return nil, fmt.Errorf("I2C.Read(): %w", err)
 	} else {
 		return reg, nil
 	}
@@ -2683,7 +2674,7 @@ func (mod *I2C) ReadReady() (bool, error) {
 	}
 
 	if stat, err := mod.status(); nil != err {
-		return false, fmt.Errorf("status(): %v", err)
+		return false, fmt.Errorf("status(): %w", err)
 	} else {
 		return stat.i2cReadPnd > 0, nil
 	}
