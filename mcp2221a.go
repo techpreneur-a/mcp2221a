@@ -8,6 +8,7 @@
 package mcp2221a
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -149,7 +150,7 @@ const (
 // interacting with that component of the device.
 // Call Close() on the device when finished to also close the USB connection.
 type MCP2221A struct {
-	Device *usb.Device
+	Device usb.Device
 	Index  byte
 	VID    uint16
 	PID    uint16
@@ -182,15 +183,8 @@ type MCP2221A struct {
 //
 // Returns an empty slice if no devices were found. See the hid package
 // documentation for details on inspecting the returned objects.
-func AttachedDevices(vid uint16, pid uint16) []usb.DeviceInfo {
-
-	var info []usb.DeviceInfo
-
-	for _, i := range usb.Enumerate(vid, pid) {
-		info = append(info, i)
-	}
-
-	return info
+func AttachedDevices(vid uint16, pid uint16) ([]usb.DeviceInfo, error) {
+	return usb.Enumerate(vid, pid)
 }
 
 // openUSBDevice returns an opened USB HID device descriptor with the given vid
@@ -200,20 +194,22 @@ func AttachedDevices(vid uint16, pid uint16) []usb.DeviceInfo {
 // Returns nil and an error if the given index is out of range (including when
 // no devices matching vid/pid were found), or if the USB HID device could not
 // be claimed or opened.
-func openUSBDevice(idx byte, vid uint16, pid uint16) (*usb.Device, error) {
+func openUSBDevice(idx byte, vid uint16, pid uint16) (usb.Device, error) {
 
-	info := AttachedDevices(vid, pid)
+	info, err := AttachedDevices(vid, pid)
+	if err != nil {
+		return nil, err
+	}
 	if int(idx) >= len(info) {
 		return nil, fmt.Errorf("device index %d out of range [0, %d]", idx, len(info)-1)
 	}
 
-	var (
-		dev *usb.Device
-		err error
-	)
-
-	if dev, err = info[idx].Open(); nil != err {
-		return nil, fmt.Errorf("Open(): %v", err)
+	dev, err := info[idx].Open()
+	if nil != err {
+		return nil, fmt.Errorf("Open(): %w", err)
+	}
+	if dev == nil {
+		return nil, fmt.Errorf("Open(): no device available")
 	}
 
 	return dev, nil
@@ -226,13 +222,9 @@ func openUSBDevice(idx byte, vid uint16, pid uint16) (*usb.Device, error) {
 // if the USB HID device could not be claimed or opened.
 func New(idx byte, vid uint16, pid uint16) (*MCP2221A, error) {
 
-	var (
-		dev *usb.Device
-		err error
-	)
-
-	if dev, err = openUSBDevice(idx, vid, pid); nil != err {
-		return nil, fmt.Errorf("openUSBDevice(): %v", err)
+	dev, err := openUSBDevice(idx, vid, pid)
+	if nil != err {
+		return nil, fmt.Errorf("openUSBDevice(): %w", err)
 	}
 
 	mcp := &MCP2221A{
@@ -382,22 +374,19 @@ func (mcp *MCP2221A) Reset(timeout time.Duration) error {
 	if _, err := mcp.send(cmdReset, cmd); nil != err {
 		return fmt.Errorf("send(): %v", err)
 	}
+	// We need to reconnect after a reset
+	mcp.Device = nil
 
-	ch := make(chan *usb.Device)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	go func(c chan *usb.Device) {
-		var d *usb.Device = nil
-		for nil == d {
-			d, _ = openUSBDevice(mcp.Index, mcp.VID, mcp.PID)
+	for mcp.Device == nil {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("New([%d]): timed out (re)opening USB HID device", mcp.Index)
+		default:
+			mcp.Device, _ = openUSBDevice(mcp.Index, mcp.VID, mcp.PID)
 		}
-		c <- d
-	}(ch)
-
-	select {
-	case <-time.After(timeout):
-		return fmt.Errorf("New([%d]): timed out opening USB HID device", mcp.Index)
-	case dev := <-ch:
-		mcp.Device = dev
 	}
 
 	// initialize the device locked flag and flash write-access flag based on the
