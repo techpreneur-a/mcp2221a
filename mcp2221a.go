@@ -175,6 +175,8 @@ type MCP2221A struct {
 	DAC  *DAC  // 1x 5-bit digital-to-analog converter (avail on 2 pins)
 	Alt  *Alt  // special-purpose GP alternate/dedicated functions
 	I2C  *I2C  // dedicated I²C SDA/SCL pins, up to 400 kHz
+	IOC *IOC   // Interrupt-On-Change podpora
+
 }
 
 // AttachedDevices returns a slice of all connected USB HID device descriptors
@@ -234,6 +236,9 @@ func New(idx byte, vid uint16, pid uint16) (*MCP2221A, error) {
 		VID:    vid,
 		PID:    pid,
 	}
+
+	ioc := &IOC{mcp: dev}
+	dev.IOC = ioc
 
 	// each module embeds the common *MCP2221A instance so that the modules can
 	// refer to each others' functions.
@@ -730,6 +735,18 @@ func (mcp *MCP2221A) ConfigUnlock(pass []byte) (bool, error) {
 		return false, fmt.Errorf("unknown reject reason")
 	}
 }
+
+
+func (m *MCP2221A) getFeatureReport(id byte, length int) ([]byte, error) {
+	buf := make([]byte, length)
+	_, err := m.Device.GetFeatureReport(id, buf)
+	return buf, err
+}
+
+func (m *MCP2221A) sendFeatureReport(data []byte) error {
+	return m.Device.SendFeatureReport(data)
+}
+
 
 // -- DEVICE ---------------------------------------------------------- [end] --
 // -----------------------------------------------------------------------------
