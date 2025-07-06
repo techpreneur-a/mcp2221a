@@ -30,10 +30,10 @@ func (ioc *IOC) Enable(pin byte, edge IntEdge) error {
 
 // Read načíta IOC flag (vracia aktuálny stav G1 pri IOC evente)
 func (ioc *IOC) Read() (IntEdge, error) {
-	buf := make([]byte, 1)
-	err := ioc.mcp.Device.GetFeatureReport(buf)
+	// použijeme getFeatureReport z MCP2221A namiesto Device.GetFeatureReport
+	buf, err := ioc.mcp.getFeatureReport(0xB3, 1)
 	if err != nil {
-		return NoInterrupt, fmt.Errorf("IOC.Read GetFeatureReport: %w", err)
+		return NoInterrupt, fmt.Errorf("IOC.Read getFeatureReport: %w", err)
 	}
 	return IntEdge(buf[0]), nil
 }
@@ -46,6 +46,6 @@ func (ioc *IOC) Clear() error {
 
 // Pomocná funkcia na odoslanie FeatureReport
 func (ioc *IOC) sendFeatureReport(data []byte) error {
-	return ioc.mcp.Device.SendFeatureReport(data)
+	return ioc.mcp.sendFeatureReport(data)
 }
 
