@@ -738,12 +738,13 @@ func (mcp *MCP2221A) ConfigUnlock(pass []byte) (bool, error) {
 
 func (m *MCP2221A) getFeatureReport(id byte, length int) ([]byte, error) {
 	buf := make([]byte, length)
-	err := m.Device.GetFeatureReport(buf)
-	return err
+	_, err := m.Device.GetFeatureReport(buf)
+	return buf, err
 }
 
 func (m *MCP2221A) sendFeatureReport(data []byte) error {
-	return m.Device.SendFeatureReport(data)
+	_, err := m.Device.SendFeatureReport(data)
+	return err
 }
 
 
