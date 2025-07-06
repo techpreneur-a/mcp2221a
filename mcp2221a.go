@@ -175,7 +175,7 @@ type MCP2221A struct {
 	DAC  *DAC  // 1x 5-bit digital-to-analog converter (avail on 2 pins)
 	Alt  *Alt  // special-purpose GP alternate/dedicated functions
 	I2C  *I2C  // dedicated I²C SDA/SCL pins, up to 400 kHz
-	IOC *IOC   // Interrupt-On-Change podpora
+	IOC  *IOC  // Interrupt-On-Change podpora
 
 }
 
