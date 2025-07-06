@@ -1,48 +1,51 @@
 package mcp2221a
 
-// IOCEdge typ reprezentuje detekovaný edge
-type IOCEdge byte
-
-const (
-	DisableEdge        IOCEdge = 0x00
-	RisingEdge         IOCEdge = 0x01
-	FallingEdge        IOCEdge = 0x02
-	RisingFallingEdge  IOCEdge = 0x03
+import (
+	"errors"
+	"fmt"
 )
 
-// IOC poskytuje API pre Interrupt-On-Change funkciu
+// Chybové konštanty
+var (
+	ErrInvalidPin  = errors.New("invalid pin for IOC (iba G1 podporovaný)")
+	ErrInvalidEdge = errors.New("invalid edge type for IOC")
+)
+
+// IOC poskytuje API pre Interrupt-On-Change
 type IOC struct {
 	mcp *MCP2221A
 }
 
-// Enable povolí Interrupt-On-Change pre GP1 (G1)
-func (i *IOC) Enable(pin byte, edge IOCEdge) error {
-	// GP1 = pin 1, podľa MCP2221A datasheetu
+// Enable zapne IOC pre GP1 (G1) s daným edge (RisingEdge/FallingEdge)
+func (ioc *IOC) Enable(pin byte, edge IntEdge) error {
 	if pin != 1 {
 		return ErrInvalidPin
 	}
 	if edge > RisingFallingEdge {
 		return ErrInvalidEdge
 	}
-	// Príkaz 0xB2 (Enable Interrupt-On-Change)
-	cmd := []byte{0xB2, edge}
-	return i.mcp.sendFeatureReport(cmd)
+	cmd := []byte{0xB2, byte(edge)}
+	return ioc.sendFeatureReport(cmd)
 }
 
-// Read načíta IOC flag pre GP1 (G1)
-func (i *IOC) Read() (IOCEdge, error) {
-	// Príkaz 0xB0 (Get Interrupt Flag)
-	buf, err := i.mcp.getFeatureReport(0xB0, 1)
+// Read načíta IOC flag (vracia aktuálny stav G1 pri IOC evente)
+func (ioc *IOC) Read() (IntEdge, error) {
+	buf := make([]byte, 1)
+	_, err := ioc.mcp.Device.GetFeatureReport(buf)
 	if err != nil {
-		return DisableEdge, err
+		return NoInterrupt, fmt.Errorf("IOC.Read GetFeatureReport: %w", err)
 	}
-	return IOCEdge(buf[0]), nil
+	return IntEdge(buf[0]), nil
 }
 
 // Clear resetuje IOC flag
-func (i *IOC) Clear() error {
-	// Príkaz 0xB1 (Clear Interrupt Flag)
+func (ioc *IOC) Clear() error {
 	cmd := []byte{0xB1, 0x00}
-	return i.mcp.sendFeatureReport(cmd)
+	return ioc.sendFeatureReport(cmd)
+}
+
+// Pomocná funkcia na odoslanie FeatureReport
+func (ioc *IOC) sendFeatureReport(data []byte) error {
+	return ioc.mcp.Device.SendFeatureReport(data)
 }
 
