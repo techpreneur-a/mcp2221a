@@ -237,8 +237,7 @@ func New(idx byte, vid uint16, pid uint16) (*MCP2221A, error) {
 		PID:    pid,
 	}
 
-	ioc := &IOC{mcp: dev}
-	dev.IOC = ioc
+	mcp.IOC = &IOC{mcp: mcp}
 
 	// each module embeds the common *MCP2221A instance so that the modules can
 	// refer to each others' functions.
@@ -739,8 +738,8 @@ func (mcp *MCP2221A) ConfigUnlock(pass []byte) (bool, error) {
 
 func (m *MCP2221A) getFeatureReport(id byte, length int) ([]byte, error) {
 	buf := make([]byte, length)
-	_, err := m.Device.GetFeatureReport(id, buf)
-	return buf, err
+	err := m.Device.GetFeatureReport(buf)
+	return err
 }
 
 func (m *MCP2221A) sendFeatureReport(data []byte) error {

@@ -31,7 +31,7 @@ func (ioc *IOC) Enable(pin byte, edge IntEdge) error {
 // Read načíta IOC flag (vracia aktuálny stav G1 pri IOC evente)
 func (ioc *IOC) Read() (IntEdge, error) {
 	buf := make([]byte, 1)
-	_, err := ioc.mcp.Device.GetFeatureReport(buf)
+	err := ioc.mcp.Device.GetFeatureReport(buf)
 	if err != nil {
 		return NoInterrupt, fmt.Errorf("IOC.Read GetFeatureReport: %w", err)
 	}
